@@ -45,8 +45,8 @@ def main():
     USERNAME = "admin"
     PASSWORD = "admin"
 
-    SAMPLE_HZ = 50.0            # logging rate
-    DURATION_S = 10.0           # total seconds to record
+    SAMPLE_HZ = 5            # logging rate
+    DURATION_S = 120           # total seconds to record
     # ------------------------------
 
     out_csv = f"tool_pose_6d_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
