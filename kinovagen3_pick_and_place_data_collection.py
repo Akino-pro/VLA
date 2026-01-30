@@ -47,10 +47,11 @@ def main():
 
     SAMPLE_HZ = 1            # logging rate
     DURATION_S = 10          # total seconds to record
+    N_JOINTS = 7             # Gen3 has 7 joints
     # ------------------------------
 
-    out_csv = f"tool_pose_6d_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    period = 1.0 / SAMPLE_HZ
+    out_csv = f"tool_pose_6d_joints_7_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    period = 1.0 / float(SAMPLE_HZ)
 
     transport, session_manager, router = connect_udp(ROBOT_IP, USERNAME, PASSWORD)
 
@@ -62,11 +63,13 @@ def main():
 
         with open(out_csv, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow([
+
+            header = [
                 "t_sec",
                 "x_m", "y_m", "z_m",
-                "theta_x_deg", "theta_y_deg", "theta_z_deg"
-            ])
+                "theta_x_deg", "theta_y_deg", "theta_z_deg",
+            ] + [f"q{i+1}_deg" for i in range(N_JOINTS)]
+            w.writerow(header)
 
             while True:
                 now = time.perf_counter()
@@ -76,15 +79,29 @@ def main():
 
                 fb = base_cyclic.RefreshFeedback()
 
-                w.writerow([
+                # Tool pose (6D)
+                row = [
                     t,
                     fb.base.tool_pose_x,
                     fb.base.tool_pose_y,
                     fb.base.tool_pose_z,
                     fb.base.tool_pose_theta_x,
                     fb.base.tool_pose_theta_y,
-                    fb.base.tool_pose_theta_z
-                ])
+                    fb.base.tool_pose_theta_z,
+                ]
+
+                # Joint angles (7)
+                # Cyclic feedback provides actuator list; each has .position
+                # Gen3 typically reports actuator position in degrees.
+                if len(fb.actuators) < N_JOINTS:
+                    raise RuntimeError(
+                        f"Expected at least {N_JOINTS} actuators, but got {len(fb.actuators)}"
+                    )
+
+                for i in range(N_JOINTS):
+                    row.append(fb.actuators[i].position)
+
+                w.writerow(row)
 
                 # simple rate control
                 next_t += period
@@ -92,7 +109,7 @@ def main():
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
-        print(f"Saved tool pose log to: {out_csv}")
+        print(f"Saved tool pose + joint log to: {out_csv}")
 
     finally:
         safe_disconnect(transport, session_manager)
