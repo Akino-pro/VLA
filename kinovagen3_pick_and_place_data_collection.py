@@ -1,14 +1,18 @@
 import csv
 import time
+import math
 from datetime import datetime
 
 from kortex_api.UDPTransport import UDPTransport
+from kortex_api.TCPTransport import TCPTransport
 from kortex_api.RouterClient import RouterClient
 from kortex_api.SessionManager import SessionManager
 from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
-from kortex_api.autogen.messages import Session_pb2
+from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
+from kortex_api.autogen.messages import Session_pb2, Base_pb2
 
-UDP_PORT = 10001  # Gen3 cyclic feedback port
+UDP_PORT = 10001  # cyclic feedback
+TCP_PORT = 10000  # base commands/queries (typical)
 
 
 def connect_udp(ip: str, username: str, password: str):
@@ -21,8 +25,25 @@ def connect_udp(ip: str, username: str, password: str):
     session_info = Session_pb2.CreateSessionInfo()
     session_info.username = username
     session_info.password = password
-    session_info.session_inactivity_timeout = 60000   # ms
-    session_info.connection_inactivity_timeout = 2000 # ms
+    session_info.session_inactivity_timeout = 60000
+    session_info.connection_inactivity_timeout = 2000
+    session_manager.CreateSession(session_info)
+
+    return transport, session_manager, router
+
+
+def connect_tcp(ip: str, username: str, password: str):
+    transport = TCPTransport()
+    transport.connect(ip, TCP_PORT)
+
+    router = RouterClient(transport, RouterClient.basicErrorCallback)
+
+    session_manager = SessionManager(router)
+    session_info = Session_pb2.CreateSessionInfo()
+    session_info.username = username
+    session_info.password = password
+    session_info.session_inactivity_timeout = 60000
+    session_info.connection_inactivity_timeout = 2000
     session_manager.CreateSession(session_info)
 
     return transport, session_manager, router
@@ -39,24 +60,45 @@ def safe_disconnect(transport, session_manager):
         pass
 
 
+def deg2rad(x_deg: float) -> float:
+    return x_deg * math.pi / 180.0
+
+
 def main():
     # --------- EDIT THESE ----------
-    ROBOT_IP = "192.168.1.10"  # change to your Gen3 IP
+    ROBOT_IP = "192.168.1.10"
     USERNAME = "admin"
     PASSWORD = "admin"
 
-    SAMPLE_HZ = 1            # logging rate
-    DURATION_S = 10          # total seconds to record
-    N_JOINTS = 7             # Gen3 has 7 joints
+    SAMPLE_HZ = 10
+    DURATION_S = 10
+    N_JOINTS = 7
+
+    EPISODE_INDEX = 0
+    TASK_INDEX = 0
+
+    # inference parameters
+    GRIPPER_DEADBAND = 0.002  # in normalized [0,1] units; tune if too jittery
     # ------------------------------
 
-    out_csv = f"tool_pose_6d_joints_7_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    out_csv = f"libero_like_no_images_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     period = 1.0 / float(SAMPLE_HZ)
 
-    transport, session_manager, router = connect_udp(ROBOT_IP, USERNAME, PASSWORD)
+    # UDP for fast arm feedback
+    udp_transport, udp_session, udp_router = connect_udp(ROBOT_IP, USERNAME, PASSWORD)
+    # TCP for gripper measured movement query
+    tcp_transport, tcp_session, tcp_router = connect_tcp(ROBOT_IP, USERNAME, PASSWORD)
 
     try:
-        base_cyclic = BaseCyclicClient(router)
+        base_cyclic = BaseCyclicClient(udp_router)
+        base = BaseClient(tcp_router)
+
+        # prepare gripper request (measured)
+        gripper_request = Base_pb2.GripperRequest()
+        gripper_request.mode = Base_pb2.GRIPPER_POSITION
+
+        last_grip = None
+        last_cmd = 1  # default open
 
         t0 = time.perf_counter()
         next_t = t0
@@ -64,55 +106,82 @@ def main():
         with open(out_csv, "w", newline="") as f:
             w = csv.writer(f)
 
-            header = [
-                "t_sec",
-                "x_m", "y_m", "z_m",
-                "theta_x_deg", "theta_y_deg", "theta_z_deg",
-            ] + [f"q{i+1}_deg" for i in range(N_JOINTS)]
+            header = (
+                ["timestamp", "frame_index", "episode_index", "task_index"]
+                + [f"state_q{i+1}_rad" for i in range(N_JOINTS)]
+                + ["action_x_m", "action_y_m", "action_z_m",
+                   "action_rx_rad", "action_ry_rad", "action_rz_rad",
+                   "action_gripper_cmd_01",
+                   "gripper_pos_measured_01"]
+            )
             w.writerow(header)
 
             while True:
                 now = time.perf_counter()
-                t = now - t0
-                if t >= DURATION_S:
+                t_sec = now - t0
+                if t_sec >= DURATION_S:
                     break
 
                 fb = base_cyclic.RefreshFeedback()
 
-                # Tool pose (6D)
-                row = [
-                    t,
+                # state: 7 joint angles (rad)
+                if len(fb.actuators) < N_JOINTS:
+                    raise RuntimeError(f"Expected {N_JOINTS} actuators, got {len(fb.actuators)}")
+                q_rad = [deg2rad(fb.actuators[i].position) for i in range(N_JOINTS)]
+
+                # action: 6D EEF pose (xyz + rpy rad)
+                action_6d = [
                     fb.base.tool_pose_x,
                     fb.base.tool_pose_y,
                     fb.base.tool_pose_z,
-                    fb.base.tool_pose_theta_x,
-                    fb.base.tool_pose_theta_y,
-                    fb.base.tool_pose_theta_z,
+                    deg2rad(fb.base.tool_pose_theta_x),
+                    deg2rad(fb.base.tool_pose_theta_y),
+                    deg2rad(fb.base.tool_pose_theta_z),
                 ]
 
-                # Joint angles (7)
-                # Cyclic feedback provides actuator list; each has .position
-                # Gen3 typically reports actuator position in degrees.
-                if len(fb.actuators) < N_JOINTS:
-                    raise RuntimeError(
-                        f"Expected at least {N_JOINTS} actuators, but got {len(fb.actuators)}"
-                    )
+                # measured gripper position (normalized [0,1] typically)
+                grip_pos = ""
+                try:
+                    meas = base.GetMeasuredGripperMovement(gripper_request)
+                    if len(meas.finger) > 0:
+                        grip_pos = float(meas.finger[0].value)
+                except Exception:
+                    # keep grip_pos empty if not available
+                    grip_pos = ""
 
-                for i in range(N_JOINTS):
-                    row.append(fb.actuators[i].position)
+                # infer open/close from measured position trend
+                if grip_pos == "":
+                    gripper_cmd = last_cmd
+                else:
+                    if last_grip is None:
+                        gripper_cmd = last_cmd
+                    else:
+                        d = grip_pos - last_grip
+                        if d > GRIPPER_DEADBAND:
+                            gripper_cmd = 1
+                        elif d < -GRIPPER_DEADBAND:
+                            gripper_cmd = 0
+                        else:
+                            gripper_cmd = last_cmd
 
+                    last_grip = grip_pos
+                    last_cmd = gripper_cmd
+
+                frame_index = int(round(t_sec * 10.0))
+
+                row = [t_sec, frame_index, EPISODE_INDEX, TASK_INDEX] + q_rad + action_6d + [gripper_cmd, grip_pos]
                 w.writerow(row)
 
-                # simple rate control
                 next_t += period
                 sleep_s = next_t - time.perf_counter()
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
-        print(f"Saved tool pose + joint log to: {out_csv}")
+        print(f"Saved log to: {out_csv}")
 
     finally:
-        safe_disconnect(transport, session_manager)
+        safe_disconnect(udp_transport, udp_session)
+        safe_disconnect(tcp_transport, tcp_session)
 
 
 if __name__ == "__main__":
