@@ -79,6 +79,7 @@ def main():
 
     # inference parameters
     GRIPPER_DEADBAND = 0.002  # in normalized [0,1] units; tune if too jittery
+    FLUSH_EVERY_N = 25        # flush every N rows to reduce data loss risk
     # ------------------------------
 
     out_csv = f"libero_like_no_images_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -97,8 +98,9 @@ def main():
         gripper_request = Base_pb2.GripperRequest()
         gripper_request.mode = Base_pb2.GRIPPER_POSITION
 
-        last_grip = None
-        last_cmd = 1  # default open
+        last_grip = None  # last measured gripper position (float) or None
+        frame_index = 0
+        rows_since_flush = 0
 
         t0 = time.perf_counter()
         next_t = t0
@@ -107,12 +109,14 @@ def main():
             w = csv.writer(f)
 
             header = (
-                ["timestamp", "frame_index", "episode_index", "task_index"]
+                ["timestamp_sec", "frame_index", "episode_index", "task_index"]
                 + [f"state_q{i+1}_rad" for i in range(N_JOINTS)]
-                + ["action_x_m", "action_y_m", "action_z_m",
-                   "action_rx_rad", "action_ry_rad", "action_rz_rad",
-                   "action_gripper_cmd_01",
-                   "gripper_pos_measured_01"]
+                + [
+                    "action_x_m", "action_y_m", "action_z_m",
+                    "action_rx_rad", "action_ry_rad", "action_rz_rad",
+                    "action_gripper_delta_cmd",      # 1 / -1 / 0
+                    "gripper_pos_measured_01"
+                ]
             )
             w.writerow(header)
 
@@ -131,46 +135,58 @@ def main():
 
                 # action: 6D EEF pose (xyz + rpy rad)
                 action_6d = [
-                    fb.base.tool_pose_x,
-                    fb.base.tool_pose_y,
-                    fb.base.tool_pose_z,
-                    deg2rad(fb.base.tool_pose_theta_x),
-                    deg2rad(fb.base.tool_pose_theta_y),
-                    deg2rad(fb.base.tool_pose_theta_z),
+                    float(fb.base.tool_pose_x),
+                    float(fb.base.tool_pose_y),
+                    float(fb.base.tool_pose_z),
+                    deg2rad(float(fb.base.tool_pose_theta_x)),
+                    deg2rad(float(fb.base.tool_pose_theta_y)),
+                    deg2rad(float(fb.base.tool_pose_theta_z)),
                 ]
 
                 # measured gripper position (normalized [0,1] typically)
-                grip_pos = ""
+                grip_pos = None
                 try:
                     meas = base.GetMeasuredGripperMovement(gripper_request)
                     if len(meas.finger) > 0:
                         grip_pos = float(meas.finger[0].value)
                 except Exception:
-                    # keep grip_pos empty if not available
-                    grip_pos = ""
+                    grip_pos = None
 
-                # infer open/close from measured position trend
-                if grip_pos == "":
-                    gripper_cmd = last_cmd
+                # infer gripper command:
+                #   1  if grip_pos increases
+                #  -1  if grip_pos decreases
+                #   0  if it stays (within deadband) or missing
+                if grip_pos is None:
+                    gripper_cmd = 0
                 else:
                     if last_grip is None:
-                        gripper_cmd = last_cmd
+                        gripper_cmd = 0
                     else:
                         d = grip_pos - last_grip
                         if d > GRIPPER_DEADBAND:
                             gripper_cmd = 1
                         elif d < -GRIPPER_DEADBAND:
-                            gripper_cmd = 0
+                            gripper_cmd = -1
                         else:
-                            gripper_cmd = last_cmd
+                            gripper_cmd = 0
 
                     last_grip = grip_pos
-                    last_cmd = gripper_cmd
 
-                frame_index = int(round(t_sec * 10.0))
-
-                row = [t_sec, frame_index, EPISODE_INDEX, TASK_INDEX] + q_rad + action_6d + [gripper_cmd, grip_pos]
+                row = (
+                    [t_sec, frame_index, EPISODE_INDEX, TASK_INDEX]
+                    + q_rad
+                    + action_6d
+                    + [gripper_cmd, "" if grip_pos is None else grip_pos]
+                )
                 w.writerow(row)
+
+                # periodic flush
+                rows_since_flush += 1
+                if rows_since_flush >= FLUSH_EVERY_N:
+                    f.flush()
+                    rows_since_flush = 0
+
+                frame_index += 1
 
                 next_t += period
                 sleep_s = next_t - time.perf_counter()
